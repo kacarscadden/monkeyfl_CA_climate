@@ -1,0 +1,77 @@
+---
+title: "Polygon calculations"
+author: "Kelly Carscadden"
+date: "04/03/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sf)
+```
+
+```{r}
+#load climate polygon areas and perimeters
+areas_df <- read_csv("clim_polygon_areas.csv")
+perimeters_df <- read_csv("clim_polygon_perimeters.csv")
+```
+
+Exploratory calculations - looking at climatic breadth and positions (i.e., drier or wetter) of populations
+
+```{r}
+#get a quick sense of the variation in climate breadths of populations by species
+areas_df %>% group_by(sp) %>%
+  filter(sp_pop != "whole sp") %>%
+  summarize(mean = mean(area),
+            max = max(area),
+            min = min(area))
+
+#calculate pairwise distances between centroids (climatic niche position)
+#remove whole-sp polygons
+pop_areas <- areas_df %>% filter(sp_pop != "whole sp")
+centroid_dist <- as.matrix(dist(pop_areas[,3:4], method = "euclidean", diag =T, upper =T)) #filling in so consistent with matrix of area comparisons created below
+
+centroid_dist <- as.data.frame(centroid_dist)
+centroid_dist$sp_pop <- colnames(centroid_dist)
+#export
+#write.csv(centroid_dist, "clim_centroid_eucl_dist.csv", row.names = F)
+```
+
+Calculate overlap between populations' climate polygons (i.e., quantify similarity of populations' hydrological histories)
+
+- here I make each polygon into a spatial object to calculate overlap in PC space
+
+```{r}
+#extracted hull coordinates - checking by plotting
+#https://gis.stackexchange.com/questions/332427/converting-points-to-polygons-by-group
+
+polys = st_as_sf(perimeters_df, coords=c("PC1","PC2"))
+
+polys = polys %>% 
+  dplyr::group_by(sp_pop) %>% 
+  dplyr::summarise() %>%
+  st_cast("POLYGON") %>%
+  st_convex_hull() #get outer convex hull for each pop
+
+#plot(polys) 
+
+#calculate overlap between polygons #https://stackoverflow.com/questions/54234895/calculate-area-overlap-for-pairs-of-polygons-in-matrix-format-in-r
+polys <- st_sfc(polys$geometry) #like a list of polygons
+
+#calculate overlapping percentage
+l2 <- lapply(polys, function(x) { 
+  lapply(polys, function(y) st_intersection( x, y ) %>% st_area() * 100 /sqrt( st_area(x) * st_area(y) ) ) 
+})
+
+poly_overlap <- matrix(unlist(l2), ncol = length(polys), byrow = TRUE)
+poly_overlap <- as.data.frame(poly_overlap)
+#View(poly_overlap)
+
+#fix column names
+colnames(poly_overlap) <- unique(perimeters_df$sp_pop) #54 populations
+poly_overlap$sp_pop <- unique(perimeters_df$sp_pop)
+
+#export
+#write.csv(poly_overlap, "clim_polygon_percent_overlap.csv", row.names = F)
+```

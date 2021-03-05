@@ -1,0 +1,162 @@
+---
+title: "Downloading and extracting web-hosted climate data"
+author: "Kelly Carscadden"
+date: '2019-12-29'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(gdalUtils)
+library(sf)
+library(raster)
+library(doMC)
+```
+
+Get list of site coordinates and subset to just the focal (experimental) populations
+```{r}
+#load in sample collection coordinates
+pop_coord_df <- read_csv("totalToPlot_collPops.csv")
+
+#load in expt pops
+exp_pops <- read_csv("compiled_biom.csv")
+
+#make monkeyflower species labels match between these datasets
+#look-up table
+sp <- unique(exp_pops$sp)
+complete_sp <- c("bicolor", "cardinalis", "douglasii", "glaucescens",
+                 "kelloggii", "moschatus", "primuloides", "primuloides"
+                 )
+key <- data.frame(sp, complete_sp)
+key <- key %>% mutate(sp = as.character(sp),
+               complete_sp = as.character(complete_sp))
+
+#affix full species names to species codes in exp_pops
+exp_pops <- exp_pops %>% plyr::join(key, by = "sp", type = "left")
+
+#re-label columns of exp_pop to match pop_coord_df (ie, 'pop' -> 'code')
+#exp_pops <- exp_pops %>% dplyr::select(sp, pop, complete_sp) %>% distinct() #55 pop labels
+colnames(exp_pops) <- c("abbrev_sp", "code", "sp")
+
+#join datasets, keeping coordinates of just experimental populations
+exp_coord_df <- exp_pops %>% 
+  plyr::join(pop_coord_df, by = c("sp", "code"), type = "left")
+
+#clean up - get rid of empty columns at the end
+exp_coord_df <- exp_coord_df[,1:24]
+
+#validate the new df
+str(exp_coord_df) #data frame
+exp_coord_df %>% dplyr::select(long, lat) #good, complete lat/long, and right number of pops
+
+#export df of focal populations & coordinates
+#write.csv(exp_coord_df, "exp_coord_df.csv")
+```
+
+
+Monthly climate data is stored online: https://cida.usgs.gov/thredds/catalog/CA-BCM-2014/HST/Monthly/catalog.html
+
+- code to access web data adapted from Mike Koontz:
+https://github.com/mikoontz/bcm-to-ee/blob/master/workflow/download-monthly-bcm.R
+
+```{r}
+#location of data online
+base_url <- "https://cida.usgs.gov/thredds/fileServer/CA-BCM-2014/HST/Monthly/"
+
+#specify climate variables and years of interest
+vars <- c("tmx", "tmn", "run", "rch", "ppt", "pet", "pck", "cwd", "aet") #9 vars 
+years <- 1964:2010 #doing 50 yrs from 2014
+#each file = approx 20-110MB
+
+#download the climate data by creating the file name for each year/variable combination
+for (i in seq_along(vars)) {
+  for (j in seq_along(years)) {
+    this_var <- vars[i]
+    this_year <- years[j]
+    
+    #make file name for the given variable and year
+    this_file <- paste0("CA_BCM_HST_Monthly_", this_var, "_", this_year, ".nc")
+    this_url <- paste0(base_url, this_file)
+    
+    #create output directory if it does not exist
+    if(!dir.exists("data/data_output")) {
+      dir.create("data/data_output", recursive = TRUE)
+    }
+    
+    #download the climate raster
+    download.file(url = this_url, 
+                  destfile = paste0("data/data_output/", this_file))
+  }
+}
+```
+
+Prep coordinate df before extracting data from climate rasters
+```{r}
+#save population labels for mapping later
+pop_labels <- exp_coord_df %>% unite("sp_pop", c(abbrev_sp, code)) %>% pull(sp_pop)
+
+#set spatial attributes  
+#make spatial points df
+coordinates(exp_coord_df)<- c("long", "lat")
+#assign projection system
+proj4string(exp_coord_df) <- CRS("+proj=longlat +datum=WGS84")
+
+#project lat/lon from populations into the coordinate system used in the climate rasters
+popTrans<-spTransform(exp_coord_df
+  ,CRS("+proj=aea +lat_1=34 +lat_2=40.5 +lat_0=0 +lon_0=-120 +x_0=0 +y_0=-4000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"))
+
+#isolate coordinates for mapping later
+popCd<-popTrans@coords
+
+#make into simple features object for ease of working with later
+popTrans <- popTrans %>% as('sf')
+```
+    
+Extract climate data from the rasters, at focal population coordinates
+```{r}
+#set up parallel computing
+nvars <- length(vars) #9
+registerDoMC(nvars)
+
+foreach (i=1:nvars) %dopar% {
+  for (j in seq_along(years)){
+   this_var <- vars[i]
+    this_year <- years[j]
+    
+    #grab the file name of the climate raster for the variable/year
+    this_file <- paste0("CA_BCM_HST_Monthly_", this_var, "_", this_year, ".nc")
+    
+    #create output directory if it does not exist
+    if(!dir.exists("data/extract")) {
+      dir.create("data/extract", recursive = TRUE)
+    }
+    
+    #make a raster brick (contains 12 months)
+    clim <- raster::brick(paste0("data/data_output/", this_file))
+    #set projection
+    crs(clim) <- st_crs(3310)$proj4string
+    
+    #extract climate data at population coordinates. Export data
+    ddpop <-extract(clim, popTrans)
+    saveRDS(ddpop, file = paste0("data/extract/", "CA_BCM_HST_Monthly_", this_var, "_",
+                                 this_year, "_pops.rds"))
+  }
+}
+```
+
+Visualize an example variable/year to check
+
+```{r}
+this_file <- "CA_BCM_HST_Monthly_cwd_1992.nc"
+clim <- raster::brick(paste0("data/data_output/", this_file))
+crs(clim) <- st_crs(3310)$proj4string
+
+#overlay populations on the example climate raster
+plot(clim[[1]], col = viridis::viridis(100)) #looking at month 1 (Jan) climatic water deficit
+points(popCd, bg ="thistle3", col = "black", cex=1, pch=21)
+
+#see population labels
+plot(popCd, type = "n")
+text(popCd, labels = pop_labels, cex = 0.3)
+```

@@ -1,0 +1,256 @@
+---
+title: "Bioclim and PCA"
+author: "Kelly Carscadden"
+date: "04/03/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dismo) #for biovars funct
+library(RcppRoll) #for sliding window
+library(GGally) #for correlation plot
+library(vegan) #for PCA
+library(viridis) #for colors
+```
+
+Aggregate climate data so is meaningful for the growing season hydrology of focal populations.
+
+1. Using a sliding 3-month-window analysis similar to Bioclim, determine min/max quarterly climate estimates (e.g., max temperature of warmest quarter)
+
+```{r}
+#specify years and variables
+years <- 1964:2014
+vars <- c("tmx", "tmn", "ppt", "pet", "pck", "cwd", "aet", "run", "rch") 
+
+#for each year, summarize the climate variables
+for (i in seq_along(years)){
+   this_year <- years[i] 
+   for (j in seq_along(vars)) {
+          this_var <- vars[j] #need to summarize each variable
+          
+          #read in raster for each variable
+          assign(paste0(this_var, "_", this_year, "_dat"),
+                 readRDS(paste0("data/extract/", "CA_BCM_HST_Monthly_", this_var, "_",
+                                 this_year, "_pops.rds")))
+    }
+  
+    #create output directory if it does not exist
+    if(!dir.exists("data/clim_summary")) {
+      dir.create("data/clim_summary", recursive = TRUE)
+    }
+    
+    #need ppt, tmn, tmx for biovars, for each year (e.g., calculates max ppt in hottest quarter)
+    #in output, rows = bioclim vars, cols = sites
+    #generates 19 bioclim variables
+    clim_agg <- as.data.frame(biovars(prec = get(paste0("ppt_", this_year, "_dat")),
+            tmin = get(paste0("tmn_", this_year, "_dat")),
+            tmax = get(paste0("tmx_", this_year, "_dat")))
+    )
+    
+    #aggregate other clim variables, in 3-mo sliding windows
+    others <- vars[!vars %in% c("ppt", "tmn", "tmx")]
+
+    for(k in seq_along(others)){
+      other_var <- others[k]
+      label <- paste0("max_", other_var)
+      
+      clim_agg <- cbind(clim_agg, 
+                                   apply(X = get(paste(other_var, this_year, "dat", sep = "_")),
+                                        MARGIN = 1, #across cols, by row
+                                        #find max 3-mo clim value. Window ID'd by start month
+                                        FUN = roll_mean,
+                                        n = 3, align = "left", na.rm = F , partial = F) %>%
+                                        apply(MARGIN = 2, FUN = max) 
+                                     )
+      #fix name of new variable (there are 19 bioclim variables)
+      colnames(clim_agg)[19+k] <- label
+    }
+    
+    #export
+    saveRDS(clim_agg, file = paste0("data/clim_summary/", "CA_BCM_HST_Monthly_",
+                                 this_year, "_summary.rds"))
+    
+}
+
+```
+
+
+2. thin climate variables based on collinearity and relevance
+- have made summaries 1964 - 2014 - using this fixed interval for all pops
+
+```{r}
+#make big data stack of all summaries, sites
+##melt so year is a column (not included in PCA)
+##add in spPop labels for subsetting - combine abbrev_sp and code in exp_coord_df
+
+summary_df <- NULL
+years <- c(1964:2014)
+
+for(i in seq_along(years)){
+  this_year <- years[i]
+  yr_df <- readRDS(paste0("data/clim_summary/CA_BCM_HST_Monthly_", this_year, "_summary.rds"))
+  
+  #annotate yrs - can add site labels after
+  yr_df$yr <- this_year
+  
+  #join to other yrs
+  summary_df <- rbind(summary_df, yr_df)
+}
+
+#add site labels
+rep_yrs <- length(years) #51 yrs
+
+#need non-spatial object to pull labels
+exp_coord_df <- read_csv("exp_coord_df.csv")
+exp_coord_df <- exp_coord_df %>% tidyr::unite(col = "sp_pop", c(abbrev_sp, code), remove = F) 
+
+summary_df$sp_pop <- rep(exp_coord_df$sp_pop, rep_yrs)
+```
+
+```{r}
+#weed out bioclim vars like annual mean temp, isothermality, seasonality, other measures of var
+summary_df_pared <- summary_df %>% dplyr::select(-bio1, -bio2, -bio3, -bio4, -bio7,
+                                                    -bio12, -bio15)
+#explore correlations & variation in diff variables
+GGally::ggpairs(summary_df_pared[1:18]) #omit yr, sp_pop
+#throwing in all data for all sites, years, for exploratory viz
+
+#several variables (eg. temp of warmest quarter and temp of driest quarter) ~ collinear given mediterranean climate - can pare down
+
+summary_df_pared <- summary_df_pared %>% dplyr::select(c(5, 6, 9, 10, 13:20))
+#tidy up labels
+summary_clim_pared <- summary_df_pared %>% rename("max_tmp" = bio10, 
+       "min_tmp" = bio11,
+       "max_ppt" = bio16,
+       "min_ppt" = bio17)#bio 10 aka mean temp of warmest 1/4, bio17 = mean ppt of driest 1/4
+rm(summary_df)
+
+#export
+#write.csv(summary_clim_pared, "summary_clim_pared.csv", row.names = F)
+```
+
+
+```{r}
+#save correlation plot of remaining clim variables
+pdf("mim clim ggpairs all yrs and sites.pdf",
+    width = 16,
+    height = 9)
+
+  GGally::ggpairs(summary_clim_pared[1:10])
+dev.off()
+```
+
+
+3. Use PCA to further reduce dimensionality
+
+```{r}
+clim.pca <- rda(decostand(summary_clim_pared[,c(1:10)], method = "standardize")) 
+
+#determine %Var explained by each PCA axis
+pca_var <- summary(clim.pca)
+round(pca_var$species, 2)
+```
+
+Each species contains multiple populations. Visualize the climatic variation in each species and populations' evolutionary history by plotting polygons from the climatic PCA
+
+```{r}
+#plot and calc avg pop ellipse area, for each sp
+summary_clim_pared <- summary_clim_pared %>% 
+  separate(sp_pop, into = c("sp", "pop"), sep = "_", remove = F) %>%
+  mutate(pop = as.factor(pop),
+         sp = as.factor(sp))
+
+site_scores <- scores(clim.pca)$sites
+```
+
+```{r}
+#join pril and prip (subspecies that belong to one species)
+summary_clim_pared_filled <- summary_clim_pared_filled %>%
+  dplyr::mutate(sp = as.character(sp))
+
+summary_clim_pared_filled$sp[summary_clim_pared_filled$sp == "PRIP"] <- "PRIM"
+summary_clim_pared_filled$sp[summary_clim_pared_filled$sp == "PRIL"] <- "PRIM"
+
+#make a plotting function that will loop across species
+sp_list <- unique(summary_clim_pared_filled$sp)
+sp_cols <- viridis(length(sp_list)) #one color per sp
+
+areas_df <- NULL
+perimeters_df <- NULL
+
+for(i in seq_along(sp_list)){
+  #subset data for sp
+  this_sp <- sp_list[i]
+  this_col <- sp_cols[i]
+  
+  sub <- summary_clim_pared_filled %>% filter(sp == this_sp)
+  pops <- unique(sub$sp_pop)
+  ind <- which(summary_clim_pared_filled$sp == this_sp)
+  scores <- site_scores[ind,]
+  
+  #plot polygons for the species as a whole, and its populations
+  plot(clim.pca, display = "sites", scaling = "symmetric", type = "n", 
+            ylim = c(-1, 0.8))
+  points(scores, pch = 21, bg = "grey66", col = "black")
+  sp_hull <- with(summary_clim_pared_filled, ordihull(clim.pca, sp, draw="lines",
+                                     col = this_col, show.groups = this_sp, lwd = 2))
+  pop_hull <- with(summary_clim_pared_filled, ordihull(clim.pca, sp_pop, draw="polygon",
+                                     col = this_col, show.groups = pops,
+                                     label = F, cex = 0.5))
+  
+  #save perimeters of polygons, for calculating overlap
+  temp <- data.frame(scores(pop_hull),
+                     sp_pop = attributes(scores(pop_hull))$hulls)
+  
+  perimeters_df <- rbind(perimeters_df, temp)
+  
+  #save polygon area calculations (estimate of climate breadth) and centroids (estimate of climatic niche position)
+  sp_df <- summary(sp_hull)
+  pop_df <- summary(pop_hull)
+  
+  dat <- data.frame(sp = this_sp, sp_pop = c("whole sp", colnames(pop_df)),
+             PC1_centroid = c(sp_df[1], pop_df[1,]),
+             PC2_centroid = c(sp_df[2], pop_df[2,]),
+             area = c(sp_df[3], pop_df[3,]))
+  
+  areas_df <- rbind(areas_df, dat)
+
+}#end of outer for
+
+#export
+#write.csv(areas_df, "clim_polygon_areas.csv", row.names = F)
+
+#export
+#write.csv(perimeters_df, "clim_polygon_perimeters.csv", row.names = F)
+```
+
+Overlay all species' climate polygons in a single plot, for ease of comparison
+```{r}
+plot(clim.pca, display = "sites", scaling = "symmetric", type = "n", 
+            ylim = c(-1, 0.8)) #updated in V2 to 0.8
+  #points(site_scores, pch = 21, bg = "grey66", col = "black")
+  sp_hull <- with(summary_clim_pared_filled, ordihull(clim.pca, sp, draw="polygon",
+                                     col = sp_cols))
+
+#re-ordering species to increase visibility in plot
+sp_rev <- summary_clim_pared_filled %>% 
+  mutate(sp = fct_relevel(sp, "PRIM", "MOSC", "CARD", "BICO", "KELL", "GLAU", "DOUG")) 
+cols_rev <- c("#FDE725FF", "#8FD744FF", "#443A83FF", "#440154FF", "#35B779FF",
+              "#21908CFF", "#31688EFF")    
+
+#save plot
+pdf("species climate polygons V2.pdf",
+      width = 4,
+      height = 4)
+
+plot(clim.pca, display = c("sites"), scaling = "symmetric", type = "n", 
+            ylim = c(-1, 0.8),
+     xlab = "PC1 (50.43%)", #UPDATE THESE IF CHANGING THE PCA
+     ylab = "PC2 (15.04%)")
+  sp_hull <- with(sp_rev, ordihull(clim.pca, sp, draw="polygon",
+                                     col = cols_rev))
+
+dev.off()    
+```

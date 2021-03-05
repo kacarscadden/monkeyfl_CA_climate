@@ -1,0 +1,77 @@
+---
+title: "Extracting climate data for monkeyflower populations"
+author: "Kelly Carscadden"
+date: "18/01/2021"
+output: html_document
+---
+
+Aim: given coordinates of study populations, extract data for several hydrological variables across 50 years, from California-wide climate rasters
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(gdalUtils)
+library(sf)
+library(raster)
+```
+
+```{r}
+#load dataset containing coordinates of study populations
+exp_coord_df <- read_csv("exp_coord_df.csv")
+```
+
+Make spatial points dataframe and re-project it to match the climate rasters
+```{r}
+#set coordinates, make into a spatial points df
+coordinates(exp_coord_df)<- c("long", "lat") 
+
+#assign the projection system
+proj4string(exp_coord_df) <- CRS("+proj=longlat +datum=WGS84") 
+
+#transform lat/lon from sites into the coordinate system used in the climate rasters
+popTrans<-spTransform(exp_coord_df
+  ,CRS("+proj=aea +lat_1=34 +lat_2=40.5 +lat_0=0 +lon_0=-120 +x_0=0 +y_0=-4000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"))
+
+#make into simple features object for ease of working with below
+popTrans <- popTrans %>% as('sf')
+```
+
+Specify the hydrological variables and years of interest. Hydrological variable codes follow http://climate.calcommons.org/dataset/CA-BCM-2014-monthly. Data from 2011-2014 stored as ascii files labeled by month
+```{r}
+#e.g., aet is the code for actual evapotranspiration
+vars <- c("tmx", "tmn", "run", "rch", "ppt", "pet", "pck", "cwd", "aet")
+years <- 2011:2014
+months <- c("jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec")
+```
+
+For each hydrological variable and year, iterate across and stack monthly raster files, and extract data at each population location
+
+- script adapted from Prahlada Papper (UC Berkeley) and Mike Koontz (CU Boulder)
+```{r}
+for(i in seq_along (vars)){
+  for(j in seq_along(years)){
+   this_var <- vars[i]
+    this_year <- years[j]
+   
+    #start with january
+     clim <- raster(paste0("/", this_var, this_year, "jan.asc"))
+     crs(clim) <- st_crs(3310)$proj4string
+       #'+proj=aea +datum=NAD83 +lat_1=34 +lat_2=40.5 +lat_0=0 +lon_0=-120 +x_0=0 +y_0=-4000000'
+
+    #create raster stack by adding additional months
+    for(m in months[2:12]) { 
+      clim <- stack(clim, raster(paste0(this_var, this_year, m, ".asc"))) 
+    }
+     
+    #create a directory for the output, if it does not already exist 
+    if(!dir.exists("Carscadden")) {
+      dir.create("Carscadden", recursive = TRUE)
+    }
+
+    #extract climate data at population coordinates. Export data
+    ddpop <-extract(normal, popTrans)
+    saveRDS(ddpop, file = paste0("Carscadden/", "CA_BCM_HST_Monthly_", this_var, "_",
+                                 this_year, "_pops.rds"))
+  }
+}
+```
